@@ -262,6 +262,38 @@ def server_push_hits(hits: list) -> int:
     return n
 
 
+# 规则变更后重扫存量车的推送上限（防止规则写太宽时一瞬间刷屏）
+RULE_RESCAN_MAX = 10
+
+
+def rescan_existing_hits(targets: list = None) -> dict:
+    """规则变更后，用当前数据重新匹配一遍存量车并补推。
+
+    解决的问题：规则只在「新事件」触发时才推送，改完规则后已存在的命中车
+    不会重新报警 —— 用户会误以为没车，其实早就在架。
+    本函数用缓存数据（不额外请求接口）重跑匹配，靠 pushed.json 的
+    sku|city|price 去重，历史已推过的不会重推。
+    """
+    if READONLY:
+        return {"skipped": "readonly"}
+    try:
+        d = get_data()
+        items = d.get("items") or []
+        if not items:
+            return {"ok": False, "info": "暂无数据"}
+        hits = hit_items(items, targets)
+        check_target_changes(hits)  # 只播种/同步生命周期基线，不产生告警
+        capped = hits[:RULE_RESCAN_MAX]
+        n = server_push_hits(capped) if capped else 0
+        if hits:
+            print(f"[规则重扫] 存量命中 {len(hits)} 辆，补推 {n} 辆"
+                  + (f"（超出上限 {RULE_RESCAN_MAX}，仅推前 {RULE_RESCAN_MAX} 辆）" if len(hits) > RULE_RESCAN_MAX else ""))
+        return {"ok": True, "total": len(hits), "pushed": n}
+    except Exception as e:
+        print(f"[规则重扫] ✗ {e}")
+        return {"ok": False, "info": str(e)}
+
+
 def check_target_changes(cur_hits: list) -> list:
     """目标车生命周期检测，返回 [(type, item)]，type ∈ 上架(重新上架)/下架(被抢)/改价。
     键 = 城市|sku：裸 sku 全国不唯一（同款同成色跨城同码），会互相覆盖漏报（2026-09-16 坑）。"""
@@ -305,11 +337,30 @@ def _push_change_alerts(alerts: list):
             print(f"[变动告警] ✗ {e}")
 
 
+def _daily_cleanup():
+    """每天跑一次 output/ 清理（日报留 7 天、日汇总留 30 天、db 回收空间）。"""
+    today = time.strftime("%Y-%m-%d")
+    if _guard.get("cleanup_day") == today:
+        return
+    _guard["cleanup_day"] = today
+    try:
+        import cleanup
+        r = cleanup.run()
+        rep = r["reports"]
+        freed = r["db"].get("freed") or 0
+        print(f"[清理] 日报留 {rep['kept']} 份（删 {rep['del_by_count'] + rep['del_by_days']} 份）"
+              f"｜临时文件 {r['temp']} 个"
+              + (f"｜history.db 回收 {freed // 1024}KB" if freed else ""))
+    except Exception as e:
+        print(f"[清理] ✗ {e}")
+
+
 def guardian():
     """服务端守护线程：浏览器关闭也能继续监控+推送。"""
     first = True
     while True:
         try:
+            _daily_cleanup()
             d = get_data()
             items = d.get("items") or []
             if not items:
@@ -335,8 +386,10 @@ def guardian():
                     server_push_hits(hits)
                 else:
                     # 新增命中（不在生命周期基线里的新车）
+                    # 基线键是 城市|sku（裸 sku 全国不唯一），必须同构比较
                     known = set(_guard["tstate"].keys())
-                    fresh = [h for h in hits if h.get("sku") and h["sku"] not in known]
+                    fresh = [h for h in hits
+                             if h.get("sku") and f"{h.get('city')}|{h['sku']}" not in known]
                     if fresh:
                         server_push_hits(fresh)
                     alerts = check_target_changes(hits)
@@ -519,6 +572,7 @@ details.sec .sec-body{padding:2px 14px 14px}
       <input id="qaMax" type="number" placeholder="¥最高" style="width:72px">
       <button class="ghost" onclick="quickAdd()">＋ 添加规则</button>
     </div>
+    <div id="ruletip" style="color:var(--gold);font-size:12px;min-height:16px;margin-bottom:6px"></div>
     <div class="rowline">
       <span class="tlabel">关键词添加</span>
       <input id="addKw" placeholder="多个关键词用逗号分隔，如：900,青玉" style="width:280px">
@@ -577,7 +631,14 @@ details.sec .sec-body{padding:2px 14px 14px}
 let DATA=[],TS=0,lastHits=0,FAILN=0;
 /* ---- 目标规则（服务端 targets.json 为准，localStorage 仅镜像） ---- */
 let targets=[{kws:["14寸|14''","900","青玉"]}],targetsReady=false;
-function saveTargets(){localStorage.setItem('dt_targets',JSON.stringify(targets));if(targetsReady)fetch('/api/targets_save',{method:'POST',headers:{'Content-Type':'application/json','X-Dbk':'1'},body:JSON.stringify({targets})}).catch(()=>{})}
+function ruleTip(t){const el=document.getElementById('ruletip');if(el){el.textContent=t||'';if(t)setTimeout(()=>{if(el.textContent===t)el.textContent=''},8000)}}
+function saveTargets(){localStorage.setItem('dt_targets',JSON.stringify(targets));
+ if(!targetsReady)return;
+ fetch('/api/targets_save',{method:'POST',headers:{'Content-Type':'application/json','X-Dbk':'1'},body:JSON.stringify({targets})})
+  .then(r=>r.json()).then(j=>{const rs=j&&j.rescan;
+   if(rs&&rs.ok&&rs.total>0)ruleTip(`🔁 已重扫存量车：当前命中 ${rs.total} 辆，补推送 ${rs.pushed} 辆`+(rs.total>rs.pushed?'（其余此前已推过）':''));
+   else if(rs&&rs.ok)ruleTip('🔁 已重扫存量车：当前无命中');
+  }).catch(()=>{})}
 async function initTargets(){try{const j=await(await fetch('/api/targets',{cache:'no-store'})).json();if(j.targets&&j.targets.length){targets=j.targets}else{const ls=JSON.parse(localStorage.getItem('dt_targets')||'null');if(ls&&ls.length)targets=ls.map(r=>Array.isArray(r)?{kws:r}:r);await saveTargets()}}catch(e){}targetsReady=true;renderChips();render()}
 /* ---- 车源快捷操作（注：微信2023.12起要求明文scheme在目标小程序后台白名单声明，第三方小程序无法外链直达，改走「卡片书签」方案） ---- */
 let MPC={path:'sportlover/zero-waste-bike/pages/home/index',query:'commodityId={commodityId}'};
@@ -1147,10 +1208,13 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(ts, list) and ts:
                     ts = [{"kws": [str(k) for k in (r.get("kws") if isinstance(r, dict) else r) or []],
                            **({"min": r["min"]} if isinstance(r, dict) and r.get("min") is not None else {}),
-                           **({"max": r["max"]} if isinstance(r, dict) and r.get("max") is not None else {})}
+                           **({"max": r["max"]} if isinstance(r, dict) and r.get("max") is not None else {}),
+                           **({"city": str(r["city"])} if isinstance(r, dict) and r.get("city") else {})}
                           for r in ts]
                     save_targets(ts)
-                    resp = {"saved": True, "count": len(ts)}
+                    # 规则一改就重扫存量车：把「改规则前就已命中、但从未推过」的车补推出来
+                    resp = {"saved": True, "count": len(ts),
+                            "rescan": rescan_existing_hits(ts)}
                 else:
                     resp = {"saved": False, "info": "targets 不能为空"}
             except Exception as e:

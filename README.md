@@ -15,8 +15,10 @@
 - **目标车生命周期**：被抢/改价/重新上架单独告警，多城市同款独立跟踪（`城市|sku` 复合键）
 - **网页看板**：统计卡 / 多维筛选 / 分页大表 / 命中横幅 / 实拍图画廊 / 官方车况报告 / 48 小时价格趋势图 / 快捷跳转导航
 - **图片代理**：服务端 Pillow 缩放 + 磁盘缓存，列表小图秒开，灯箱看大图不卡
-- **只读模式**：`readonly.flag` 开关 —— 只展示快照不访问官方接口
-- **看门狗自愈**：Windows 计划任务每 5 分钟探活拉起
+- **规则变更即重扫**：改完规则立刻用当前数据重跑匹配，把「改规则前就已命中但从未推过」的存量车补推出来（不会漏掉已在架的车）
+- **`output/` 自动清理**：每天自动清理一次 —— 巡检日报留 7 天、日汇总留 30 天、SQLite 真空回收空间，长期挂机磁盘不涨
+- **只读模式**：`readonly.flag` / `DT_READONLY=1` 开关 —— 只展示快照不访问官方接口
+- **看门狗自愈**：Windows 计划任务每 5 分钟探活拉起（Mac/Linux 见下文 launchd / systemd 方案）
 
 ## 📦 安装
 
@@ -42,6 +44,92 @@ python webapp.py
 
 5. **（可选）看门狗自愈**：Windows 任务计划程序创建任务，每 5 分钟运行 `watchdog.bat`；服务挂掉自动拉起，`readonly.flag` 存在时以只读模式启动
 
+## 🍎🐧 macOS / Linux 部署
+
+代码本身是纯 Python 标准库 + Pillow，**跨平台可直接跑**；只有「看门狗自愈」这一层是平台相关的（`watchdog.bat` / `start_*.bat` 仅 Windows）。Mac/Linux 用下面的方式替代。
+
+### 1. 安装与启动
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt      # Pillow 用于图片代理（服务端缩放，浏览器只看小图）
+
+cp push_config.example.json push_config.json
+cp targets.example.json targets.json
+
+python3 webapp.py                    # 打开 http://localhost:8787
+```
+
+> 端口被占用时查：`lsof -i :8787`（macOS/Linux）或 `ss -ltnp | grep 8787`（Linux）。**务必保证只有一个实例**，多实例会重复扫描、重复写变动日志。
+
+### 2. 常驻 + 崩溃自愈
+
+**macOS（launchd，推荐）** — 存为 `~/Library/LaunchAgents/com.decathlon.monitor.plist`，路径改成你自己的：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.decathlon.monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/absolute/path/to/.venv/bin/python</string>
+    <string>/absolute/path/to/webapp.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/absolute/path/to/project</string>
+  <key>RunAtLoad</key><true/>          <!-- 登录即启动 -->
+  <key>KeepAlive</key><true/>          <!-- 挂了自动拉起 -->
+  <key>StandardOutPath</key><string>/tmp/decathlon-monitor.log</string>
+  <key>StandardErrorPath</key><string>/tmp/decathlon-monitor.err</string>
+</dict></plist>
+```
+
+```bash
+launchctl load  ~/Library/LaunchAgents/com.decathlon.monitor.plist   # 启用
+launchctl unload ~/Library/LaunchAgents/com.decathlon.monitor.plist  # 停用
+```
+
+**Linux（systemd 用户级，推荐）** — 存为 `~/.config/systemd/user/decathlon-monitor.service`：
+
+```ini
+[Unit]
+Description=Decathlon buyback monitor
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/absolute/path/to/project
+ExecStart=/absolute/path/to/.venv/bin/python webapp.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user enable --now decathlon-monitor   # 开机自启 + 立即启动
+systemctl --user status decathlon-monitor
+loginctl enable-linger $USER    # 服务器/无桌面场景，保证注销后仍在跑
+```
+
+**兜底方案（cron，任意 Unix）** — 每 5 分钟探活，`flock` 防止重复启动：
+
+```bash
+*/5 * * * * flock -n /tmp/dtm.lock -c 'curl -sf http://127.0.0.1:8787/api/query >/dev/null || (cd /absolute/path/to/project && exec /absolute/path/to/.venv/bin/python webapp.py >> webapp.log 2>&1)'
+```
+
+### 3. 平台差异对照
+
+| 项目 | Windows | macOS / Linux |
+|---|---|---|
+| 启动命令 | `python webapp.py` | `python3 webapp.py` |
+| 看门狗 | 计划任务 + `watchdog.bat` | launchd `KeepAlive` / systemd `Restart=always` / cron + flock |
+| 只读模式 | `readonly.flag` 文件（watchdog 读取） | `DT_READONLY=1 python3 webapp.py`（环境变量直接生效） |
+| 日志 | `webapp.log` | launchd/systemd 指定路径，或 shell 重定向 |
+| 端口排查 | `netstat -ano \| findstr 8787` | `lsof -i :8787` |
+
 ## 🖐️ 接口怎么来的
 
 官方回收小程序的接口无需登录凭证，公开可调。想自己重新抓包（换城市/品类参数）看 [docs/抓包教程.md](docs/抓包教程.md) 和 [零基础手把手版](docs/抓包教程-手把手版.md)（使用 Reqable，全程点鼠标）。
@@ -58,9 +146,10 @@ python webapp.py
 ├── daily_report.py       # 每日日报生成+推送
 ├── avatar.py             # 实拍图/官方车况详情（免凭证双接口）
 ├── build_cities.py       # 城市门店坐标表构建
+├── cleanup.py            # output/ 自动清理（日报/SQLite 真空/日志截断，每天一次）
 ├── cities.json           # 全国城市/门店坐标
-├── watchdog.bat          # 看门狗（计划任务用，支持只读模式开关）
-├── py_test.py            # Python 回归测试（20 断言）
+├── watchdog.bat          # 看门狗（Windows 计划任务用，支持只读模式开关）
+├── py_test.py            # Python 回归测试（29 断言）
 ├── sim_pg.js / js_test.js / js_check.js  # 前端模拟/检查
 └── docs/                 # 抓包教程
 ```
@@ -68,7 +157,8 @@ python webapp.py
 ## 🧪 测试
 
 ```bash
-python py_test.py      # tracker/rules/生命周期 20 断言
+python py_test.py      # tracker/rules/生命周期/规则重扫/清理 29 断言
+python cleanup.py --dry  # 先看会删什么（不真删）
 node js_test.js        # 前端逻辑测试（需服务运行）
 ```
 

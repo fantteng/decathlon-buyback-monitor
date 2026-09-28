@@ -153,6 +153,68 @@ try:
 finally:
     history.DB_PATH = test_db
 
+# ---------- 7. 规则变更重扫存量车（rescan_existing_hits） ----------
+_orig_get_data, _orig_push = webapp.get_data, webapp.server_push_hits
+webapp._guard["tstate"] = {}
+webapp.get_data = lambda: {"time": time.time(), "items": [GZ, BJ], "cities": 2}
+_calls = []
+
+
+def _fake_push(hits):
+    _calls.append(list(hits))
+    return len(hits)
+
+
+webapp.server_push_hits = _fake_push
+try:
+    R_800 = [{"kws": ["14寸|14''", "900", "青玉"], "max": 800}]
+    r1 = webapp.rescan_existing_hits(R_800)
+    check("7.1 规则放宽后重扫: 存量命中全部找出", r1.get("ok") and r1["total"] == 2, str(r1))
+    check("7.2 补推数量=命中数（历史已推的由 pushed.json 去重）",
+          r1.get("pushed") == 2 and len(_calls) == 1, str(r1))
+    r2 = webapp.rescan_existing_hits([{"kws": ["14寸"], "max": 100}])
+    check("7.3 无命中: total=0 pushed=0", r2.get("total") == 0 and r2.get("pushed") == 0, str(r2))
+    r3 = webapp.rescan_existing_hits([{"kws": ["14寸"], "city": "广州市"}])
+    check("7.4 城市限定生效: 只命中广州 1 辆", r3.get("total") == 1, str(r3))
+    _ro = webapp.READONLY
+    webapp.READONLY = True
+    r4 = webapp.rescan_existing_hits(R_800)
+    webapp.READONLY = _ro
+    check("7.5 只读模式跳过重扫（不推不扫）", r4.get("skipped") == "readonly", str(r4))
+finally:
+    webapp.get_data, webapp.server_push_hits = _orig_get_data, _orig_push
+
+# ---------- 8. output 自动清理 ----------
+import os  # noqa: E402
+import cleanup  # noqa: E402
+
+_old_out = cleanup.OUT
+_o = TMP / "out"
+_o.mkdir()
+cleanup.OUT = _o
+try:
+    now = time.time()
+
+    def mk(name, age_days):
+        p = _o / name
+        p.write_text("x", encoding="utf-8")
+        t = now - age_days * 86400
+        os.utime(p, (t, t))
+        return p
+
+    for i in range(8):                       # 同一天 8 份（i 越大越旧）
+        mk(f"report_today_{i}.md", i / 1000.0)
+    r = cleanup.clean_reports(keep=3, days=7)
+    check("8.1 超额日报只留最新 3 份", r["total"] == 8 and r["kept"] == 3
+          and r["del_by_count"] == 5, str(r))
+    check("8.2 每天最新一份受保护", r["kept_daily"] == 1, str(r))
+    mk("report_ancient.md", 40)              # 40 天前，远超 30 天保护期
+    r2 = cleanup.clean_reports(keep=3, days=7)
+    check("8.3 过期日报按天数删除", r2["del_by_days"] >= 1, str(r2))
+    check("8.4 小体积 db 跳过不动", cleanup.clean_db().get("skipped") is True)
+finally:
+    cleanup.OUT = _old_out
+
 # ---------- 结果 ----------
 print(f"\n通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
 if FAIL:
