@@ -1,0 +1,5 @@
+{
+  "_说明": "小程序跳转路径模板，抓包时可从官方小程序页面获取；{dsm} 等占位符由看板自动填充",
+  "path": "sportlover/zero-waste-bike/pages/product-detail/index",
+  "query": "dsmCode={dsm}&modelCode={model}&quality={quality}&storeId=&city={city}&latitude={lat}&longitude={lng}"
+}

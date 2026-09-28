@@ -1,0 +1,27 @@
+# 个人配置（含密钥，绝不提交）
+push_config.json
+config.json
+readonly.flag
+
+# 运行数据
+output/
+imgcache/
+*.log
+*.db
+snapshot*.json
+latest.json
+changes.json
+pushed.json
+push_state.json
+HIT.json
+
+# 开发临时文件
+page.html
+page_check.html
+test_mp.html
+diag_*
+*_t_*.json
+wx_procs.txt
+__pycache__/
+_pylibs/
+.workbuddy/

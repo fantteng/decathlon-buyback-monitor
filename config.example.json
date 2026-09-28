@@ -1,0 +1,24 @@
+{
+  "_说明": "抓包后由 WorkBuddy 自动填写，也可手动改。以下为示例结构。",
+  "city": "西安",
+  "targets": {
+    "size": "14",
+    "model_keywords": ["900"],
+    "color_keywords": ["青玉"],
+    "condition": ["A", "B"]
+  },
+  "requests": [
+    {
+      "_说明": "每个门店/城市一条；POST 时填 body，GET 时留空",
+      "name": "示例门店",
+      "method": "GET",
+      "url": "https://api.example.decathlon.cn/xxx?storeId=123&page={{page}}",
+      "headers": {
+        "User-Agent": "抓包时复制",
+        "Authorization": "抓包时复制（如有）"
+      },
+      "body": null,
+      "pages": 1
+    }
+  ]
+}
