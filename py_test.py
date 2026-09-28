@@ -215,6 +215,45 @@ try:
 finally:
     cleanup.OUT = _old_out
 
+# ---------- 9. 接口健康检查（官方改字段名会静默停摆） ----------
+_ok_items = [{"price": 599.0, "title": "x", "sku": "s%d" % i, "city": "广州市"} for i in range(60)]
+_bad_items = [{"price": None, "title": "x", "sku": "s%d" % i, "city": "广州市"} for i in range(60)]
+s1 = webapp.schema_health_check(_ok_items)
+check("9.1 价格正常: ok=True", s1["ok"] is True and s1["rate"] == 0.0, str(s1))
+s2 = webapp.schema_health_check(_bad_items)
+check("9.2 价格全缺失(接口改版): ok=False", s2["ok"] is False and s2["rate"] == 1.0, str(s2))
+s3 = webapp.schema_health_check([{"price": None}] * 10)
+check("9.3 样本<50 不误报", s3["ok"] is True, str(s3))
+s4 = webapp.schema_health_check([{"price": 599.0} for _ in range(90)] + [{"price": None}] * 10)
+check("9.4 缺失率10% 属正常不告警", s4["ok"] is True and s4["rate"] == 0.1, str(s4))
+s5 = webapp.schema_health_check([{"price": "599"} for _ in range(60)])
+check("9.5 字符串价格能正确解析", s5["ok"] is True, str(s5))
+
+# ---------- 10. 规则重扫后台异步推送（不阻塞 HTTP） ----------
+webapp._guard["tstate"] = {}
+webapp.get_data = lambda: {"time": time.time(), "items": [GZ, BJ], "cities": 2}
+_calls2 = []
+_orig_push2 = webapp.server_push_hits
+
+
+def _fake_push2(hits):
+    _calls2.append(list(hits))
+    return len(hits)
+
+
+webapp.server_push_hits = _fake_push2
+try:
+    rb = webapp.rescan_existing_hits([{"kws": ["14寸|14''", "900", "青玉"], "max": 800}], background=True)
+    check("10.1 后台模式立即返回 pushed=-1", rb.get("pushed") == -1 and rb.get("total") == 2, str(rb))
+    for _ in range(60):
+        if _calls2:
+            break
+        time.sleep(0.05)
+    check("10.2 后台线程确实完成推送", len(_calls2) == 1 and len(_calls2[0]) == 2, str(_calls2))
+finally:
+    webapp.server_push_hits = _orig_push2
+    webapp.get_data = _orig_get_data
+
 # ---------- 结果 ----------
 print(f"\n通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
 if FAIL:

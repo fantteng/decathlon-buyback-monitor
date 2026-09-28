@@ -202,7 +202,8 @@ def get_data(force=False):
 #   2. 目标车被抢(下架)/改价/重新上架 → 变动告警
 #   3. 连续 3 轮扫到 0 辆 → 接口可能变更告警（每小时最多提醒 1 次）
 
-_guard = {"fail_streak": 0, "last_alert": 0.0, "tstate": {}}
+_guard = {"fail_streak": 0, "last_alert": 0.0, "tstate": {},
+          "schema": {"ok": True}, "schema_alert": 0.0}
 GUARD_INTERVAL = 30
 
 PUSH_STATE_PATH = BASE / "output" / "push_state.json"
@@ -265,14 +266,78 @@ def server_push_hits(hits: list) -> int:
 # 规则变更后重扫存量车的推送上限（防止规则写太宽时一瞬间刷屏）
 RULE_RESCAN_MAX = 10
 
+# ---------- 接口健康检查：官方改字段名会「静默停摆」 ----------
+# 典型场景：官方把 sellingPrice 改名 → 车还在、列表非空、fail_streak 不涨，
+# 但价格全空 → 规则永不命中 → 用户以为没车，其实是坏了。现有告警覆盖不到。
+SCHEMA_MIN_ITEMS = 50        # 样本太小时不判断（少量空值属正常，避免误报）
+SCHEMA_MISS_RATE = 0.9       # 价格缺失率 ≥ 此值判定为「接口字段变更」
+SCHEMA_ALERT_COOLDOWN = 6 * 3600   # 同类告警冷却 6 小时
 
-def rescan_existing_hits(targets: list = None) -> dict:
+
+def schema_health_check(items: list) -> dict:
+    """检测接口字段是否还认得：价格大面积缺失 = 官方改字段名/改结构。"""
+    res = {"ok": True, "total": len(items), "miss_price": 0, "rate": 0.0}
+    if len(items) < SCHEMA_MIN_ITEMS:
+        return res
+    miss = 0
+    for it in items:
+        p = it.get("price")
+        try:
+            v = float(p) if p not in (None, "", "null") else None
+        except (TypeError, ValueError):
+            v = None
+        if v is None:
+            miss += 1
+    rate = miss / len(items)
+    res.update(miss_price=miss, rate=round(rate, 3))
+    if rate >= SCHEMA_MISS_RATE:
+        res["ok"] = False
+    return res
+
+
+def _schema_alert(schema: dict):
+    """字段异常告警（带冷却 + 每轮打印）。"""
+    _guard["schema"] = schema
+    if schema.get("ok"):
+        return
+    now = time.time()
+    print(f"[健康检查] ⚠️ 价格缺失率 {schema['rate']:.0%}"
+          f"（{schema['miss_price']}/{schema['total']}）——接口字段可能已变更")
+    if now - _guard.get("schema_alert", 0) < SCHEMA_ALERT_COOLDOWN:
+        return
+    _guard["schema_alert"] = now
+    try:
+        wx_send("⚠️ 迪卡侬监控数据异常（疑似接口改版）",
+                f"本轮扫到 {schema['total']} 辆，其中 {schema['miss_price']} 辆读不到价格"
+                f"（缺失率 {schema['rate']:.0%}）。\n\n"
+                "车还在架，但价格字段失效会导致目标规则永不命中——\n"
+                "请打开看板核对，若列表价格全空说明官方接口已改版，需要更新解析代码。\n"
+                "（此类告警每 6 小时最多一次）",
+                {"count": schema["total"]})
+        print("[健康检查] ✅ 已推送接口改版告警")
+    except Exception as e:
+        print(f"[健康检查] 告警推送失败: {e}")
+
+
+def _bg_push(hits: list):
+    """后台线程推送（每条推送约 1 秒网络请求，不能阻塞 HTTP 响应）。"""
+    try:
+        n = server_push_hits(hits)
+        print(f"[规则重扫] 后台补推完成：{n}/{len(hits)} 辆")
+    except Exception as e:
+        print(f"[规则重扫] 后台推送失败: {e}")
+
+
+def rescan_existing_hits(targets: list = None, background: bool = False) -> dict:
     """规则变更后，用当前数据重新匹配一遍存量车并补推。
 
     解决的问题：规则只在「新事件」触发时才推送，改完规则后已存在的命中车
     不会重新报警 —— 用户会误以为没车，其实早就在架。
     本函数用缓存数据（不额外请求接口）重跑匹配，靠 pushed.json 的
     sku|city|price 去重，历史已推过的不会重推。
+
+    background=True 时只同步做匹配（纯内存，毫秒级），推送丢后台线程，
+    HTTP 立即返回；返回 pushed=-1 表示「后台推送中」。
     """
     if READONLY:
         return {"skipped": "readonly"}
@@ -284,10 +349,16 @@ def rescan_existing_hits(targets: list = None) -> dict:
         hits = hit_items(items, targets)
         check_target_changes(hits)  # 只播种/同步生命周期基线，不产生告警
         capped = hits[:RULE_RESCAN_MAX]
-        n = server_push_hits(capped) if capped else 0
         if hits:
-            print(f"[规则重扫] 存量命中 {len(hits)} 辆，补推 {n} 辆"
+            print(f"[规则重扫] 存量命中 {len(hits)} 辆"
                   + (f"（超出上限 {RULE_RESCAN_MAX}，仅推前 {RULE_RESCAN_MAX} 辆）" if len(hits) > RULE_RESCAN_MAX else ""))
+        if background:
+            if capped:
+                threading.Thread(target=_bg_push, args=(capped,),
+                                 daemon=True, name="rule-rescan").start()
+                return {"ok": True, "total": len(hits), "pushed": -1}
+            return {"ok": True, "total": len(hits), "pushed": 0}
+        n = server_push_hits(capped) if capped else 0
         return {"ok": True, "total": len(hits), "pushed": n}
     except Exception as e:
         print(f"[规则重扫] ✗ {e}")
@@ -377,6 +448,7 @@ def guardian():
                         print(f"[守护] 告警推送失败: {e}")
             else:
                 _guard["fail_streak"] = 0
+                _schema_alert(schema_health_check(items))   # 字段改名静默停摆检测
                 hits = hit_items(items)
                 if first:
                     # 首轮：播种生命周期基线 + 当前命中车走 push_content 去重后推送
@@ -636,7 +708,9 @@ function saveTargets(){localStorage.setItem('dt_targets',JSON.stringify(targets)
  if(!targetsReady)return;
  fetch('/api/targets_save',{method:'POST',headers:{'Content-Type':'application/json','X-Dbk':'1'},body:JSON.stringify({targets})})
   .then(r=>r.json()).then(j=>{const rs=j&&j.rescan;
-   if(rs&&rs.ok&&rs.total>0)ruleTip(`🔁 已重扫存量车：当前命中 ${rs.total} 辆，补推送 ${rs.pushed} 辆`+(rs.total>rs.pushed?'（其余此前已推过）':''));
+   if(rs&&rs.ok&&rs.total>0){const p=rs.pushed;
+    ruleTip(p<0?`🔁 已重扫存量车：命中 ${rs.total} 辆，正在后台补推送…`
+                :`🔁 已重扫存量车：当前命中 ${rs.total} 辆，补推送 ${p} 辆`+(rs.total>p?'（其余此前已推过）':''));}
    else if(rs&&rs.ok)ruleTip('🔁 已重扫存量车：当前无命中');
   }).catch(()=>{})}
 async function initTargets(){try{const j=await(await fetch('/api/targets',{cache:'no-store'})).json();if(j.targets&&j.targets.length){targets=j.targets}else{const ls=JSON.parse(localStorage.getItem('dt_targets')||'null');if(ls&&ls.length)targets=ls.map(r=>Array.isArray(r)?{kws:r}:r);await saveTargets()}}catch(e){}targetsReady=true;renderChips();render()}
@@ -873,6 +947,10 @@ function initToggles(){
 /* ---- 提示音 ---- */
 function beep(){try{const ctx=new (window.AudioContext||window.webkitAudioContext)();const o=ctx.createOscillator();const g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.type='sine';o.frequency.value=880;g.gain.value=.25;o.start();setTimeout(()=>o.stop(),400);}catch(e){}}
 /* ---- 数据加载 ---- */
+function schemaWarn(ok){let el=document.getElementById('schemawarn');
+ if(ok!==false){if(el)el.style.display='none';return}
+ if(!el)document.getElementById('status').insertAdjacentHTML('beforebegin','<span id="schemawarn" class="badge" style="border-color:var(--red);color:var(--red);margin-right:8px" title="扫到的车辆读不到价格，官方接口字段可能已改版——此时目标规则会永不命中，并非真的没车">⚠️ 数据异常：价格字段失效</span>');
+ else el.style.display=''}
 async function load(force){
  const s=document.getElementById('status');
  /* 手动查询才显示提示；后台自动刷新静默进行，杜绝状态栏闪变 */
@@ -884,6 +962,7 @@ async function load(force){
   const j=await r.json();
   if(j.readonly&&!window._ro){window._ro=1;document.getElementById('status').insertAdjacentHTML('beforebegin','<span class="badge" style="border-color:var(--sub);color:var(--sub);margin-right:8px" title="只读模式：展示最近一次扫描快照，不访问官方接口、不推送">📖 只读模式</span>')}
   DATA=j.items;TS=j.time;FAILN=j.fail_streak||0;window._loadedOnce=true;
+  schemaWarn(j.schema_ok);
   const dsig=DATA.length+'|'+DATA.map(d=>d.sku+':'+d.price).join(',');
   if(dsig!==window._dsig){window._dsig=dsig;buildFilters()}
   render();loadChanges();
@@ -1064,7 +1143,8 @@ class Handler(BaseHTTPRequestHandler):
             force = "force=1" in (urlparse(self.path).query or "")
             d = get_data(force)
             b = json.dumps({"time": _cache["time"], "cities": _cache["cities"], "items": d["items"],
-                            "fail_streak": _guard["fail_streak"], "readonly": READONLY},
+                            "fail_streak": _guard["fail_streak"], "readonly": READONLY,
+                            "schema_ok": bool(_guard["schema"].get("ok", True))},
                            ensure_ascii=False).encode("utf-8")
             self._send(200, b, "application/json; charset=utf-8")
         elif path == "/api/targets":
@@ -1213,8 +1293,9 @@ class Handler(BaseHTTPRequestHandler):
                           for r in ts]
                     save_targets(ts)
                     # 规则一改就重扫存量车：把「改规则前就已命中、但从未推过」的车补推出来
+                    # 匹配同步（毫秒级）、推送后台，避免点保存时页面卡住好几秒
                     resp = {"saved": True, "count": len(ts),
-                            "rescan": rescan_existing_hits(ts)}
+                            "rescan": rescan_existing_hits(ts, background=True)}
                 else:
                     resp = {"saved": False, "info": "targets 不能为空"}
             except Exception as e:
